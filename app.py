@@ -1,43 +1,37 @@
+import os
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from transformers import pipeline
+from typing import Optional
+from dotenv import load_dotenv
 import psycopg2
 import requests
-import os
-from dotenv import load_dotenv
-from typing import Optional
-# ------------------------------
-# Load environment variables
-# ------------------------------
+
 load_dotenv()
 
-DATABASE_URL="postgresql://almanet_uk_b3pg_user:hmWLlk6zUlnKpSSoJfo9X6TUSbJJqwn9@dpg-d46v5rc9c44c738p0p8g-a.oregon-postgres.render.com/almanet_uk_b3pg"
+DATABASE_URL = "postgresql://almanet_uk_b3pg_user:hmWLlk6zUlnKpSSoJfo9X6TUSbJJqwn9@dpg-d46v5rc9c44c738p0p8g-a.oregon-postgres.render.com/almanet_uk_b3pg"
 
-
-# ------------------------------
-# FastAPI App
-# ------------------------------
 app = FastAPI(title="Chat Monitoring NLP Service")
 
-# ------------------------------
-# Abuse Detection Model
-# ------------------------------
-abuse_classifier = pipeline("text-classification", model="unitary/toxic-bert")
+# Lazy load NLP model (prevents Out of Memory)
+abuse_classifier = None
+THRESHOLD = 0.85
 
-# ------------------------------
-# PostgreSQL Connection (Render DB)
-# ------------------------------
+
+def load_nlp_model():
+    global abuse_classifier
+    if abuse_classifier is None:
+        from transformers import pipeline
+        abuse_classifier = pipeline("text-classification", model="unitary/toxic-bert")
+    return abuse_classifier
+
+
 def get_connection():
     try:
         conn = psycopg2.connect(DATABASE_URL, sslmode="require")
         return conn
     except Exception as e:
-        print("❌ Database connection error:", e)
+        print("❌ DB Error:", e)
         return None
-
-# ------------------------------
-# Request Body Model
-# ------------------------------
 
 
 class ChatMessage(BaseModel):
@@ -47,15 +41,12 @@ class ChatMessage(BaseModel):
     attachment_url: Optional[str] = None
 
 
-# ------------------------------
-# Save Chat to Database
-# ------------------------------
 def save_chat(sender_id, receiver_id, content, attachment_url, abuse_detected, abuse_score, abuse_label):
     try:
         conn = get_connection()
-        if conn is None:
+        if not conn:
             return False
-        
+
         cursor = conn.cursor()
         query = """
         INSERT INTO messages
@@ -67,76 +58,64 @@ def save_chat(sender_id, receiver_id, content, attachment_url, abuse_detected, a
             abuse_detected, abuse_score, abuse_label, abuse_score
         ))
         conn.commit()
-
         cursor.close()
         conn.close()
         return True
 
     except Exception as e:
-        print("❌ Error saving chat:", e)
+        print("❌ Error saving:", e)
         return False
 
-# ------------------------------
-# NLP Abuse Detection
-# ------------------------------
-THRESHOLD = 0.85
+
 def detect_abuse(message):
     try:
-        result = abuse_classifier(message)[0]
-        label = result['label']
-        score = result['score']
+        classifier = load_nlp_model()
+        result = classifier(message)[0]
 
-        abuse_detected = (label.lower() in ["toxic", "abuse", "offensive"] 
-                          and score >= THRESHOLD)
+        label = result["label"]
+        score = result["score"]
+        abuse_detected = (label.lower() in ["toxic", "abuse", "offensive"] and score >= THRESHOLD)
 
         return abuse_detected, round(score * 100, 2), label
+
     except Exception as e:
         print("⚠ NLP error:", e)
         return False, 0, "neutral"
 
-# ------------------------------
-# API: Monitor & Save Chat
-# ------------------------------
+
 @app.post("/api/messages")
 def monitor_chat(chat: ChatMessage):
 
-    # Validate message
     if not chat.content and not chat.attachment_url:
         raise HTTPException(status_code=400, detail="Message or attachment required")
 
-    # NLP Check
     abuse_detected, abuse_score, abuse_label = detect_abuse(chat.content or "")
 
-    # Save to DB
     saved = save_chat(
-        chat.sender_id,
-        chat.receiver_id,
-        chat.content,
-        chat.attachment_url,
-        abuse_detected,
-        abuse_score,
-        abuse_label
+        chat.sender_id, chat.receiver_id, chat.content,
+        chat.attachment_url, abuse_detected, abuse_score, abuse_label
     )
 
     if not saved:
-        raise HTTPException(status_code=500, detail="Failed to save chat in database.")
+        raise HTTPException(status_code=500, detail="DB save failed")
 
-    # If abusive → send alert to Node backend
+    # Alert Node backend ONLY if abuse detected
     if abuse_detected:
         try:
-            response = requests.post("http://127.0.0.1:3435/api/alerts", json={
-                "sender_id": chat.sender_id,
-                "receiver_id": chat.receiver_id,
-                "content": chat.content,
-                "abuse_detected": True,
-                "abuse_score": abuse_score,
-                "abuse_label": abuse_label
-            })
-            print("📩 Alert sent:", response.status_code)
+            requests.post(
+                "https://your-node-backend-url.onrender.com/api/alerts",
+                json={
+                    "sender_id": chat.sender_id,
+                    "receiver_id": chat.receiver_id,
+                    "content": chat.content,
+                    "abuse_detected": True,
+                    "abuse_score": abuse_score,
+                    "abuse_label": abuse_label
+                }
+            )
         except Exception as e:
-            print("⚠️ Failed to send alert:", e)
+            print("⚠️ Alert sending failed:", e)
 
-    # Return API response
     return {
         "sender_id": chat.sender_id,
         "receiver_id": chat.receiver_id,
@@ -145,3 +124,13 @@ def monitor_chat(chat: ChatMessage):
         "abuse_score": abuse_score,
         "abuse_label": abuse_label
     }
+
+
+# Render Startup (DO NOT REMOVE)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "app:app",
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 8000))
+    )
