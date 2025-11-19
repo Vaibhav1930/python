@@ -1,7 +1,8 @@
 fastapi
 uvicorn
 transformers
-googletrans==4.0.0-rc1
+torch
 psycopg2-binary
+python-dotenv
 requests
-
+pydantic
