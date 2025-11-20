@@ -6,13 +6,14 @@ from typing import Optional
 import psycopg2
 from psycopg2.pool import SimpleConnectionPool
 import requests
-
-# Lightweight model imports
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import torch
 import torch.nn.functional as F
 
+# HF transformers (lightweight)
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
 # ---------------------------------------------------
-# Load environment variables
+# Load ENV
 # ---------------------------------------------------
 load_dotenv()
 
@@ -24,38 +25,43 @@ if not DATABASE_URL:
 
 
 # ---------------------------------------------------
-# FastAPI app
+# FastAPI
 # ---------------------------------------------------
 app = FastAPI(title="NLP Monitoring Service (Lightweight)")
 
 
 # ---------------------------------------------------
-# Load Lightweight Model (SAFE for Render FREE)
+# Load Model
 # ---------------------------------------------------
 MODEL_NAME = "cardiffnlp/twitter-roberta-base-offensive"
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
 try:
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
+    model.to(device)
     print("✅ Lightweight NLP model loaded")
 except Exception as e:
-    print("❌ Failed to load lightweight model:", e)
+    print("❌ Model load failed:", e)
     raise
 
 
+# Cardiff NLP mapping
+LABELS = ["not-offensive", "offensive", "abusive"]  # model dependent
+
+
 # ---------------------------------------------------
-# DB Connection Pool
+# DB Pool
 # ---------------------------------------------------
 try:
     db_pool = SimpleConnectionPool(
         minconn=1,
         maxconn=5,
-        dsn=DATABASE_URL,
-        sslmode="require"
+        dsn=DATABASE_URL
     )
-    print("✅ PostgreSQL connection pool created")
+    print("✅ PostgreSQL pool ready")
 except Exception as e:
-    print("❌ DB connection pool error:", e)
+    print("❌ PostgreSQL connection error:", e)
     raise
 
 
@@ -72,7 +78,7 @@ def release_conn(conn):
 
 
 # ---------------------------------------------------
-# Request body
+# Request Body
 # ---------------------------------------------------
 class ChatMessage(BaseModel):
     sender_id: str
@@ -82,29 +88,35 @@ class ChatMessage(BaseModel):
 
 
 # ---------------------------------------------------
-# NLP abuse detection (Lightweight)
+# Abuse Detection
 # ---------------------------------------------------
 def detect_abuse(message: str):
-    if not message.strip():
-        return False, 0, "neutral"
+    message = (message or "").strip()
+    if not message:
+        return False, 0.0, "neutral"
 
     try:
-        inputs = tokenizer(message, return_tensors="pt")
+        inputs = tokenizer(message, return_tensors="pt").to(device)
         outputs = model(**inputs)
-        scores = F.softmax(outputs.logits, dim=1)
+        probs = F.softmax(outputs.logits, dim=1)[0]
 
-        offensive_score = float(scores[0][2])  # class index 2 = offensive
-        abuse_detected = offensive_score >= 0.70
+        # get highest class
+        idx = int(torch.argmax(probs))
+        label = LABELS[idx]
+        score = float(probs[idx])
 
-        return abuse_detected, round(offensive_score * 100, 2), "offensive"
+        # final flag
+        abuse = label in ["offensive", "abusive"] and score >= 0.70
+
+        return abuse, round(score * 100, 2), label
 
     except Exception as e:
         print("⚠ NLP error:", e)
-        return False, 0, "error"
+        return False, 0.0, "error"
 
 
 # ---------------------------------------------------
-# Save message to DB
+# Save Message
 # ---------------------------------------------------
 def save_message(sender, receiver, content, url, abuse, score, label):
     conn = get_conn()
@@ -115,7 +127,7 @@ def save_message(sender, receiver, content, url, abuse, score, label):
         cur = conn.cursor()
         qry = """
             INSERT INTO messages
-            (sender_id, receiver_id, content, attachment_url, 
+            (sender_id, receiver_id, content, attachment_url,
              abuse_detected, abuse_score, sentiment, sentiment_score, is_read)
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,FALSE)
         """
@@ -130,7 +142,7 @@ def save_message(sender, receiver, content, url, abuse, score, label):
         return True
 
     except Exception as e:
-        print("❌ Error saving message:", e)
+        print("❌ DB Insert Error:", e)
         return False
 
     finally:
@@ -144,7 +156,10 @@ def save_message(sender, receiver, content, url, abuse, score, label):
 def monitor(chat: ChatMessage):
 
     if not chat.content and not chat.attachment_url:
-        raise HTTPException(status_code=400, detail="Message or attachment is required.")
+        raise HTTPException(
+            status_code=400,
+            detail="Either message or attachment is required."
+        )
 
     abuse_detected, score, label = detect_abuse(chat.content or "")
 
@@ -161,6 +176,7 @@ def monitor(chat: ChatMessage):
     if not saved:
         raise HTTPException(status_code=500, detail="Database save failed.")
 
+    # send alert if abuse
     if abuse_detected and NODE_ALERT_URL:
         try:
             requests.post(
@@ -176,7 +192,7 @@ def monitor(chat: ChatMessage):
                 timeout=3
             )
         except Exception as e:
-            print("⚠ Failed to send alert:", e)
+            print("⚠ Alert send failed:", e)
 
     return {
         "sender_id": chat.sender_id,
@@ -189,7 +205,7 @@ def monitor(chat: ChatMessage):
 
 
 # ---------------------------------------------------
-# Render Start Command Port Binding
+# Render Port Bind
 # ---------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
