@@ -1,155 +1,197 @@
+import os
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from transformers import pipeline
-import psycopg2
-import requests
-import os
 from dotenv import load_dotenv
 from typing import Optional
+import psycopg2
+from psycopg2.pool import SimpleConnectionPool
+import requests
 
-# ------------------------------
+# Lightweight model imports
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import torch.nn.functional as F
+
+# ---------------------------------------------------
 # Load environment variables
-# ------------------------------
+# ---------------------------------------------------
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 NODE_ALERT_URL = os.getenv("NODE_ALERT_URL")
 
-# ------------------------------
-# FastAPI App
-# ------------------------------
-app = FastAPI(title="Chat Monitoring NLP Service")
+if not DATABASE_URL:
+    raise Exception("❌ DATABASE_URL missing in environment variables")
 
-# ------------------------------
-# Abuse Detection Model
-# ------------------------------
-abuse_classifier = pipeline("text-classification", model="unitary/toxic-bert")
 
-# ------------------------------
-# PostgreSQL Connection
-# ------------------------------
-def get_connection():
+# ---------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------
+app = FastAPI(title="NLP Monitoring Service (Lightweight)")
+
+
+# ---------------------------------------------------
+# Load Lightweight Model (SAFE for Render FREE)
+# ---------------------------------------------------
+MODEL_NAME = "cardiffnlp/twitter-roberta-base-offensive"
+
+try:
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
+    print("✅ Lightweight NLP model loaded")
+except Exception as e:
+    print("❌ Failed to load lightweight model:", e)
+    raise
+
+
+# ---------------------------------------------------
+# DB Connection Pool
+# ---------------------------------------------------
+try:
+    db_pool = SimpleConnectionPool(
+        minconn=1,
+        maxconn=5,
+        dsn=DATABASE_URL,
+        sslmode="require"
+    )
+    print("✅ PostgreSQL connection pool created")
+except Exception as e:
+    print("❌ DB connection pool error:", e)
+    raise
+
+
+def get_conn():
     try:
-        conn = psycopg2.connect(DATABASE_URL, sslmode="require")
-        return conn
-    except Exception as e:
-        print("❌ Database connection error:", e)
+        return db_pool.getconn()
+    except:
         return None
 
-# ------------------------------
-# Request Body Model
-# ------------------------------
+
+def release_conn(conn):
+    if conn:
+        db_pool.putconn(conn)
+
+
+# ---------------------------------------------------
+# Request body
+# ---------------------------------------------------
 class ChatMessage(BaseModel):
     sender_id: str
     receiver_id: str
     content: Optional[str] = None
     attachment_url: Optional[str] = None
 
-# ------------------------------
-# Save Chat to Database
-# ------------------------------
-def save_chat(sender_id, receiver_id, content, attachment_url,
-              abuse_detected, abuse_score, abuse_label):
+
+# ---------------------------------------------------
+# NLP abuse detection (Lightweight)
+# ---------------------------------------------------
+def detect_abuse(message: str):
+    if not message.strip():
+        return False, 0, "neutral"
 
     try:
-        conn = get_connection()
-        if conn is None:
-            return False
+        inputs = tokenizer(message, return_tensors="pt")
+        outputs = model(**inputs)
+        scores = F.softmax(outputs.logits, dim=1)
 
-        cursor = conn.cursor()
-        query = """
-        INSERT INTO messages
-        (sender_id, receiver_id, content, attachment_url, abuse_detected, 
-        abuse_score, sentiment, sentiment_score, is_read)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,FALSE)
-        """
+        offensive_score = float(scores[0][2])  # class index 2 = offensive
+        abuse_detected = offensive_score >= 0.70
 
-        cursor.execute(query, (
-            sender_id, receiver_id, content, attachment_url,
-            abuse_detected, abuse_score, abuse_label, abuse_score
-        ))
-
-        conn.commit()
-        cursor.close()
-        conn.close()
-        return True
-
-    except Exception as e:
-        print("❌ Error saving chat:", e)
-        return False
-
-# ------------------------------
-# NLP Abuse Detection
-# ------------------------------
-THRESHOLD = 0.85
-
-def detect_abuse(message):
-    try:
-        result = abuse_classifier(message)[0]
-        label = result["label"]
-        score = result["score"]
-
-        abuse_detected = (label.lower() in ["toxic", "abuse", "offensive"]
-                          and score >= THRESHOLD)
-
-        return abuse_detected, round(score * 100, 2), label
+        return abuse_detected, round(offensive_score * 100, 2), "offensive"
 
     except Exception as e:
         print("⚠ NLP error:", e)
-        return False, 0, "neutral"
+        return False, 0, "error"
 
-# ------------------------------
-# API: Monitor & Save Chat
-# ------------------------------
+
+# ---------------------------------------------------
+# Save message to DB
+# ---------------------------------------------------
+def save_message(sender, receiver, content, url, abuse, score, label):
+    conn = get_conn()
+    if not conn:
+        return False
+
+    try:
+        cur = conn.cursor()
+        qry = """
+            INSERT INTO messages
+            (sender_id, receiver_id, content, attachment_url, 
+             abuse_detected, abuse_score, sentiment, sentiment_score, is_read)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,FALSE)
+        """
+
+        cur.execute(qry, (
+            sender, receiver, content, url,
+            abuse, score, label, score
+        ))
+
+        conn.commit()
+        cur.close()
+        return True
+
+    except Exception as e:
+        print("❌ Error saving message:", e)
+        return False
+
+    finally:
+        release_conn(conn)
+
+
+# ---------------------------------------------------
+# API Endpoint
+# ---------------------------------------------------
 @app.post("/api/messages")
-def monitor_chat(chat: ChatMessage):
+def monitor(chat: ChatMessage):
 
     if not chat.content and not chat.attachment_url:
-        raise HTTPException(status_code=400, detail="Message or attachment required")
+        raise HTTPException(status_code=400, detail="Message or attachment is required.")
 
-    abuse_detected, abuse_score, abuse_label = detect_abuse(chat.content or "")
+    abuse_detected, score, label = detect_abuse(chat.content or "")
 
-    saved = save_chat(
+    saved = save_message(
         chat.sender_id,
         chat.receiver_id,
         chat.content,
         chat.attachment_url,
         abuse_detected,
-        abuse_score,
-        abuse_label
+        score,
+        label
     )
 
     if not saved:
-        raise HTTPException(status_code=500, detail="Failed to save chat in database.")
+        raise HTTPException(status_code=500, detail="Database save failed.")
 
-    # If abusive → send alert to Node backend
     if abuse_detected and NODE_ALERT_URL:
         try:
-            response = requests.post(f"{NODE_ALERT_URL}/api/alerts", json={
-                "sender_id": chat.sender_id,
-                "receiver_id": chat.receiver_id,
-                "content": chat.content,
-                "abuse_detected": True,
-                "abuse_score": abuse_score,
-                "abuse_label": abuse_label
-            })
-            print("📩 Alert sent:", response.status_code)
+            requests.post(
+                f"{NODE_ALERT_URL}/api/alerts",
+                json={
+                    "sender_id": chat.sender_id,
+                    "receiver_id": chat.receiver_id,
+                    "content": chat.content,
+                    "abuse_detected": True,
+                    "abuse_score": score,
+                    "abuse_label": label
+                },
+                timeout=3
+            )
         except Exception as e:
-            print("⚠️ Failed to send alert:", e)
+            print("⚠ Failed to send alert:", e)
 
     return {
         "sender_id": chat.sender_id,
         "receiver_id": chat.receiver_id,
         "content": chat.content,
         "abuse_detected": abuse_detected,
-        "abuse_score": abuse_score,
-        "abuse_label": abuse_label
+        "abuse_score": score,
+        "abuse_label": label
     }
 
-# ------------------------------
-# Render Port Binding
-# ------------------------------
+
+# ---------------------------------------------------
+# Render Start Command Port Binding
+# ---------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)
+    uvicorn.run("app:app", host="0.0.0.0", port=port)
